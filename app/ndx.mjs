@@ -1,0 +1,295 @@
+#!/usr/bin/env node
+// ndx — Netwrix Documentation knowledge-graph + RAG chatbot CLI.
+//
+//   node ndx.mjs <command> [args] [--flags]
+//
+// Build:    build · ingest · embed
+// Inspect:  stats · manifest · node · neighbors · path
+// Query:    search · ask · chat
+//
+// Run `node ndx.mjs help` for the full list.
+
+import { existsSync, readFileSync } from 'node:fs';
+import readline from 'node:readline';
+import { config, paths } from './config.mjs';
+import { out, log, fmtInt } from './lib/log.mjs';
+
+// --- tiny arg parser -------------------------------------------------------
+function parseArgs(argv) {
+  const flags = {};
+  const pos = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) flags[key] = true;
+      else {
+        flags[key] = next;
+        i++;
+      }
+    } else if (a.startsWith('-') && a.length > 1 && isNaN(Number(a))) {
+      const key = a.slice(1);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('--')) flags[key] = true;
+      else {
+        flags[key] = next;
+        i++;
+      }
+    } else {
+      pos.push(a);
+    }
+  }
+  return { flags, pos };
+}
+
+const embedOver = (f) => {
+  const o = {};
+  if (f.provider) o.provider = f.provider;
+  if (f['embed-model']) o.model = f['embed-model']; // --model is reserved for the chat model
+  return o;
+};
+
+const HELP = `ndx — Netwrix documentation knowledge graph + RAG chatbot
+
+USAGE
+  node ndx.mjs <command> [args] [--flags]
+
+BUILD
+  build               Ingest docs + embed chunks (full pipeline)
+  ingest              Build graph + chunk corpus + manifest (no embeddings)
+  embed               Embed the chunk corpus into the vector store
+    flags: --product <id>  --limit <n>  --images
+           --provider local|openai|voyage|hash   --embed-model <name>
+
+INSPECT
+  stats               Node/edge/type counts for the built graph
+  manifest            Print the manifest summary
+  node <id>           Show a node and its neighbours
+  neighbors <id>      List neighbours          [--rel R --dir out|in|both]
+  path <a> <b>        Shortest path between two node ids
+
+QUERY
+  search <query>      Vector search over chunks [-k N --tier docs|kb --product id]
+  ask <question>      RAG answer with citations [-k N --tier --product --model M]
+  chat                Interactive RAG REPL      [-k N --model M --tier --product]
+
+ENV
+  NDX_EMBED_PROVIDER  local (default) | openai | voyage | hash
+  NDX_CHAT_MODEL      claude-haiku-4-5 (default) | claude-opus-4-8 | ...
+  ANTHROPIC_API_KEY   required for ask/chat   OPENAI_API_KEY / VOYAGE_API_KEY for those providers
+
+EXAMPLES
+  node ndx.mjs build --product auditor --provider hash
+  node ndx.mjs search "active directory permissions outdated" --tier kb
+  node ndx.mjs ask "How do I configure SQL Server auditing?" --product auditor
+  node ndx.mjs chat`;
+
+// --- commands --------------------------------------------------------------
+
+async function cmdBuild(flags) {
+  const { runBuild } = await import('./lib/pipeline.mjs');
+  const r = await runBuild({
+    productFilter: flags.product || null,
+    limit: Number(flags.limit || 0),
+    includeImages: !!flags.images,
+    embed: embedOver(flags),
+  });
+  out(
+    `\nBuilt: ${fmtInt(r.ing.counts.documents)} docs, ${fmtInt(r.ing.counts.kbArticles)} KB articles, ` +
+      `${fmtInt(r.ing.counts.chunks)} chunks, ${fmtInt(r.ing.gstats.nodes)} nodes, ${fmtInt(r.ing.gstats.edges)} edges.`
+  );
+  out(`Embedded ${fmtInt(r.emb.count)} chunks (${r.emb.provider}:${r.emb.model}, ${r.emb.dim}d).`);
+  out(`Artifacts in ${paths.manifest.replace(/manifest\.json$/, '')}`);
+}
+
+async function cmdIngest(flags) {
+  const { runIngest } = await import('./lib/ingest.mjs');
+  const r = await runIngest({
+    productFilter: flags.product || null,
+    limit: Number(flags.limit || 0),
+    includeImages: !!flags.images,
+  });
+  out(
+    `\nIngested ${fmtInt(r.counts.files)} files -> ${fmtInt(r.gstats.nodes)} nodes, ` +
+      `${fmtInt(r.gstats.edges)} edges, ${fmtInt(r.counts.chunks)} chunks.`
+  );
+  out('Run `node ndx.mjs embed` next (or use `build` to do both).');
+}
+
+async function cmdEmbed(flags) {
+  const { runEmbed } = await import('./lib/pipeline.mjs');
+  const r = await runEmbed(embedOver(flags));
+  out(`Embedded ${fmtInt(r.count)} chunks (${r.provider}:${r.model}, ${r.dim}d).`);
+}
+
+function loadManifest() {
+  if (!existsSync(paths.manifest)) throw new Error('No manifest. Run `node ndx.mjs ingest` or `build` first.');
+  return JSON.parse(readFileSync(paths.manifest, 'utf8'));
+}
+
+function cmdStats() {
+  const m = loadManifest();
+  out(`\n${m.name}`);
+  out(`generated ${m.generatedAt}`);
+  out(`\nCounts:`);
+  for (const [k, v] of Object.entries(m.counts)) out(`  ${k.padEnd(12)} ${fmtInt(v)}`);
+  out(`\nNode types:`);
+  for (const [k, v] of Object.entries(m.graph.nodeTypes).sort((a, b) => b[1] - a[1]))
+    out(`  ${k.padEnd(12)} ${fmtInt(v)}`);
+  out(`\nEdge relations:`);
+  for (const [k, v] of Object.entries(m.graph.edgeRelations).sort((a, b) => b[1] - a[1]))
+    out(`  ${k.padEnd(14)} ${fmtInt(v)}`);
+  if (m.embedding) out(`\nEmbedding: ${m.embedding.provider}:${m.embedding.model} (${m.embedding.dim}d, ${fmtInt(m.embedding.count)} vectors)`);
+  else out(`\nEmbedding: (not built yet — run \`node ndx.mjs embed\`)`);
+}
+
+function cmdManifest() {
+  const m = loadManifest();
+  out(`\n${m.name}  —  generated ${m.generatedAt}`);
+  out(`${fmtInt(m.counts.documents)} docs · ${fmtInt(m.counts.kbArticles)} KB articles · ${fmtInt(m.counts.chunks)} chunks`);
+  out(`\nProducts (${m.products.length}):`);
+  for (const p of m.products) {
+    const vers = p.versions.map((v) => `${v.version}:${v.docCount}`).join(' ');
+    out(`  ${p.id.padEnd(26)} ${String(p.docCount).padStart(5)} docs  ${String(p.kbArticleCount).padStart(4)} KB   ${vers}`);
+  }
+  out(`\nCategories: ${m.categories.join(', ')}`);
+}
+
+async function withGraph(fn) {
+  const { Graph } = await import('./lib/graph.mjs');
+  if (!existsSync(paths.graph)) throw new Error('No graph. Run `node ndx.mjs ingest` or `build` first.');
+  return fn(Graph.load(paths.graph));
+}
+
+function cmdNode(id) {
+  return withGraph((g) => {
+    const n = g.get(id);
+    if (!n) return out(`Node not found: ${id}\n(tip: use \`search\` to find docs, ids look like doc:auditor@10.6/...)`);
+    out(`\n${n.type}  ${n.id}`);
+    for (const [k, v] of Object.entries(n))
+      if (k !== 'id' && k !== 'type') out(`  ${k}: ${Array.isArray(v) ? v.join(', ') : v}`);
+    const outN = g.neighbors(id, { dir: 'out' });
+    const inN = g.neighbors(id, { dir: 'in' });
+    out(`\n  out (${outN.length}):`);
+    for (const e of outN.slice(0, 25)) out(`    -${e.rel}-> ${e.id}`);
+    if (outN.length > 25) out(`    … +${outN.length - 25} more`);
+    out(`  in (${inN.length}):`);
+    for (const e of inN.slice(0, 25)) out(`    <-${e.rel}- ${e.id}`);
+    if (inN.length > 25) out(`    … +${inN.length - 25} more`);
+  });
+}
+
+function cmdNeighbors(id, flags) {
+  return withGraph((g) => {
+    if (!g.has(id)) return out(`Node not found: ${id}`);
+    const ns = g.neighbors(id, { dir: flags.dir || 'out', rel: flags.rel || null });
+    out(`\n${ns.length} neighbour(s) of ${id} [dir=${flags.dir || 'out'}${flags.rel ? ' rel=' + flags.rel : ''}]:`);
+    for (const e of ns) {
+      const n = g.get(e.id);
+      const arrow = e.dir === 'in' ? `<-${e.rel}-` : `-${e.rel}->`;
+      out(`  ${arrow} ${e.id}  ${n ? `(${n.type}: ${n.label || ''})` : ''}`);
+    }
+  });
+}
+
+function cmdPath(a, b) {
+  return withGraph((g) => {
+    const p = g.path(a, b);
+    if (!p) return out(`No path between\n  ${a}\n  ${b}`);
+    out('');
+    p.forEach((id, i) => {
+      const n = g.get(id);
+      out(`${'  '.repeat(i)}${i ? '└─ ' : ''}${id}  ${n ? `(${n.type})` : ''}`);
+    });
+  });
+}
+
+async function cmdSearch(query, flags) {
+  const { retrieve } = await import('./lib/retrieve.mjs');
+  const hits = await retrieve(query, {
+    k: Number(flags.k || 8),
+    tier: flags.tier || null,
+    product: flags.product || null,
+  });
+  out(`\nTop ${hits.length} for: "${query}"\n`);
+  hits.forEach((h, i) => {
+    out(`[${i + 1}] ${h.score.toFixed(3)}  ${h.ref}`);
+    if (h.url) out(`     ${h.url}`);
+    const snippet = h.text.replace(/\s+/g, ' ').slice(0, 200);
+    out(`     ${snippet}…\n`);
+  });
+}
+
+async function cmdAsk(question, flags) {
+  const { retrieve } = await import('./lib/retrieve.mjs');
+  const { answer } = await import('./lib/chat.mjs');
+  const hits = await retrieve(question, {
+    k: Number(flags.k || config.chat.topK),
+    tier: flags.tier || null,
+    product: flags.product || null,
+  });
+  if (hits.length === 0) return out('No relevant passages found. Is the store built?');
+  const { reply, sources, model } = await answer(question, hits, { model: flags.model });
+  out(`\n${reply}\n`);
+  out(`— sources (${model}) —`);
+  for (const s of sources) out(`  [${s.n}] ${s.ref}${s.url ? '  ' + s.url : ''}`);
+}
+
+async function cmdChat(flags) {
+  const { retrieve } = await import('./lib/retrieve.mjs');
+  const { answerWithHistory } = await import('./lib/chat.mjs');
+  const model = flags.model || config.chat.model;
+  const k = Number(flags.k || config.chat.topK);
+  out(`ndx chat — model ${model}. Ask about the Netwrix docs. Ctrl-C or "exit" to quit.\n`);
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = () => rl.question('› ', async (q) => {
+    q = q.trim();
+    if (!q) return ask();
+    if (q === 'exit' || q === 'quit') return rl.close();
+    try {
+      const hits = await retrieve(q, { k, tier: flags.tier || null, product: flags.product || null });
+      const { reply, sources, userMessage } = await answerWithHistory(q, hits, history, { model });
+      out(`\n${reply}\n`);
+      out(`  sources: ${sources.map((s) => `[${s.n}] ${s.ref}`).join(' · ')}\n`);
+      history.push(userMessage, { role: 'assistant', content: reply });
+      if (history.length > 8) history.splice(0, history.length - 8); // keep last few turns
+    } catch (e) {
+      out(`! ${e.message}\n`);
+    }
+    ask();
+  });
+  const history = [];
+  ask();
+}
+
+// --- dispatch --------------------------------------------------------------
+async function main() {
+  const [, , cmd, ...rest] = process.argv;
+  const { flags, pos } = parseArgs(rest);
+  try {
+    switch (cmd) {
+      case 'build': return await cmdBuild(flags);
+      case 'ingest': return await cmdIngest(flags);
+      case 'embed': return await cmdEmbed(flags);
+      case 'stats': return cmdStats();
+      case 'manifest': return cmdManifest();
+      case 'node': return await cmdNode(pos[0]);
+      case 'neighbors': case 'neighbours': return await cmdNeighbors(pos[0], flags);
+      case 'path': return await cmdPath(pos[0], pos[1]);
+      case 'search': return await cmdSearch(pos.join(' '), flags);
+      case 'ask': return await cmdAsk(pos.join(' '), flags);
+      case 'chat': return await cmdChat(flags);
+      case 'help': case undefined: case '--help': case '-h': return out(HELP);
+      default:
+        out(`Unknown command: ${cmd}\n`);
+        out(HELP);
+        process.exitCode = 1;
+    }
+  } catch (e) {
+    log(`error: ${e.message}`);
+    process.exitCode = 1;
+  }
+}
+
+main();

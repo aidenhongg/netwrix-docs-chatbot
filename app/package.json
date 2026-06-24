@@ -1,0 +1,28 @@
+{
+  "name": "ndx",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Netwrix documentation knowledge graph + RAG chatbot",
+  "bin": {
+    "ndx": "./ndx.mjs"
+  },
+  "scripts": {
+    "build": "node ndx.mjs build",
+    "ingest": "node ndx.mjs ingest",
+    "embed": "node ndx.mjs embed",
+    "stats": "node ndx.mjs stats",
+    "search": "node ndx.mjs search",
+    "ask": "node ndx.mjs ask",
+    "chat": "node ndx.mjs chat"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.106.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^4.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,14 @@
+# The Netwrix documentation base is its own separate repository — not vendored here.
+# The chatbot reads it from a sibling ./docs checkout at build time.
+docs/
+
+# Node
+node_modules/
+
+# Generated chatbot artifacts (graph.json, chunks.jsonl, vectors.f32, manifest.json)
+app/out/
+out/
+
+.env
+*.log
+.DS_Store
