@@ -69,8 +69,9 @@ function parseYamlish(raw) {
       const val = kv[2];
       mode = null;
       if (val === '' || val === undefined) {
-        // Could be a block list or just empty; default to empty string, lists fill in.
-        data[key] = '';
+        // Empty value: an indented block list may follow (keywords/tags/products).
+        // Leave the key UNSET so the list-item branch (which keys off `=== undefined`)
+        // can initialize the array; if nothing follows it simply stays absent.
       } else if (val.startsWith('>')) {
         mode = 'fold';
       } else if (val.startsWith('|')) {

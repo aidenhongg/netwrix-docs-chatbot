@@ -68,6 +68,11 @@ QUERY  (--level chunk|doc|heading picks the embedding space; default chunk)
   search <query>   Semantic search          [--level L -k N --tier docs|kb --product id]
   similar <nodeId> Nearest nodes to a node  [-k N --cross-tier --product id --level L]
   cluster          Community detection       [--level doc|heading --tier docs|kb --product id --threshold T]
+
+TUNE THE RANKER  (KB articles as labels — see "Tuning the ranking function" below)
+  labels           Build + show the labeled query→gold set
+  eval <flags>     Score one ranking config (CIs, per-product, per-field)
+  tune <flags>     Sweep configs; leaderboard by held-out metric (CV / holdout / LOPO)
 ```
 
 Common flags: `--product <id>`, `--limit <n>`, `--images`, `--level <chunk|doc|heading>`,
@@ -97,6 +102,49 @@ Primitives built on these:
 regular docs use description + heading outline. `search`/`cluster` take `--tier docs|kb`, and
 `similar` stays **within a node's tier by default** (KB↔KB, docs↔docs) — pass `--cross-tier`
 to bridge (e.g. surface the KB articles closest to a doc, or vice-versa).
+
+## Tuning the ranking function (KB articles as labels)
+
+The KB is a free, in-domain **labeled relevance set**: each article's `title` / `keywords` /
+`description` / `symptom` text is a query whose relevant answer is known. `ndx` turns that into
+an offline harness for tuning *retrieval ranking* (no LLM, no generation) — measure one config,
+or sweep configs with proper cross-validation.
+
+```bash
+node ndx.mjs labels --target kb                            # build labels; show coverage
+node ndx.mjs eval --level doc --signal rrf                 # score ONE config (CIs, per product, per field)
+node ndx.mjs tune --levels doc,chunk --metric mrr --cv 5   # sweep configs; held-out leaderboard
+node ndx.mjs tune --query-fields symptom --lopo            # generalize across products
+```
+
+**The ranking config you tune:** `--level chunk|doc|heading` · `--signal vector|bm25|linear|rrf`
+· `--alpha` (linear) · `--pool max|mean|sum` (how chunk/heading hits pool up to a doc) ·
+`--candN`. BM25 is a built-in zero-dep lexical index, so hybrid fusion (`linear`, `rrf`) has a
+real α and rank-fusion to tune — not just `level`.
+
+**Labels (`--target` / `--gold`):**
+- `kb` (default) — gold = the KB article itself; queries from its own fields. The large set (~1,400 articles).
+- `kb --gold link` — gold = the doc(s) the article `LINKS_TO` (sparse in this export: ~9 articles).
+- `doc` — gold = a regular doc; queries from its title/headings (the docs-base slice).
+- `--query-fields title,description,keywords,symptom` — choose which. **Always reported per field**,
+  because `title`/`keywords`/`description` self-match at doc level (they're *in* the embedded text),
+  while `symptom` is the realistic, discriminative query.
+
+**Splits (all grouped by article + stratified by product, seeded — `--seed`):**
+- `--cv 5` — grouped, stratified **k-fold CV** (default).
+- `--holdout 0.3` — grouped train/test split.
+- `--lopo` — **leave-one-product-out**: does the config generalize to a product it never saw?
+- `--final-holdout 0.2` — carve an untouched test set; the CV winner is re-scored on it.
+
+**Metrics:** MRR, Hit@1/5/10, Recall@10, nDCG@10 — reported overall (bootstrap CIs over groups),
+macro-averaged across products, and broken out per product and per query-field. Choose the tuning
+objective with `--metric mrr|ndcg@10|recall@10|hit@5`.
+
+**Why grouped + stratified, not random:** one article yields several *correlated* queries — split
+by article so they don't straddle folds; and KB volume is wildly imbalanced across products (auditor
+has 641, many have 0) — stratify + macro-average so one product can't dominate. The per-field numbers
+expose self-retrieval leakage instead of hiding it. (`build` indexes the KB articles, so they're
+retrievable in production; these labels measure how well that retrieval ranks them.)
 
 ---
 
@@ -170,6 +218,13 @@ app/
     pipeline.mjs     per-level embed + full build orchestration
     retrieve.mjs     retrieve(level) + similar(nodeId) — tier-aware (the composition seam)
     cluster.mjs      community detection over node vectors (union-find)
+    bm25.mjs         zero-dep BM25 lexical index
+    rank.mjs         tunable ranking function (vector + BM25, fusion, pooling)
+    labels.mjs       KB-derived (query→gold) relevance labels
+    splits.mjs       grouped/stratified holdout · k-fold · leave-one-product-out
+    metrics.mjs      MRR / Hit / Recall / nDCG + bootstrap CIs
+    evaluate.mjs     eval one config · tune (CV/holdout/LOPO) leaderboard
+    rng.mjs          seeded PRNG for reproducible splits
   out/               generated artifacts, incl. emb/<level>.{jsonl,f32} (gitignored)
 ```
 

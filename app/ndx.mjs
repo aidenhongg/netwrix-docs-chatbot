@@ -6,6 +6,7 @@
 // Build:    build · ingest · embed
 // Inspect:  stats · manifest · node · neighbors · path
 // Query:    search · similar · cluster
+// Tune:     labels · eval · tune   (KB articles as ranking labels)
 //
 // Retrieval primitives only — no built-in answer/LLM layer (compose your own on
 // retrieve()/similar()). Run `node ndx.mjs help` for the full list.
@@ -51,6 +52,7 @@ const embedOver = (f) => {
 };
 const levelsOf = (f) => (f.levels ? String(f.levels).split(',').map((s) => s.trim()).filter(Boolean) : null);
 const fmtByLevel = (bl) => Object.entries(bl).map(([l, v]) => `${l}=${fmtInt(v.count)} (${v.dim}d)`).join(', ');
+const splitList = (s) => String(s).split(',').map((x) => x.trim()).filter(Boolean);
 
 const HELP = `ndx — Netwrix documentation knowledge graph + retrieval harness
 
@@ -79,6 +81,16 @@ QUERY  (--level chunk|doc|heading selects the embedding space; default chunk)
 
   (No answer/LLM command by design — compose your own on retrieve()/similar(); see README.)
 
+TUNE THE RANKER  (KB articles as labels — gold = the KB article itself by default)
+  labels              Build + cache the labeled query→gold set; show coverage
+  eval <flags>        Score ONE ranking config: MRR/Hit@k/Recall@10/nDCG@10 (+CIs),
+                        broken out per product and per query-field
+  tune <flags>        Sweep ranking configs; leaderboard by held-out metric
+    labels:  --target kb|doc  --gold self|link  --query-fields title,description,keywords,symptom  --product id  --labels <file>
+    ranker:  --level chunk|doc|heading  --signal vector|bm25|linear|rrf  --alpha 0.5  --pool max|mean|sum  --candN 200
+    grid:    --levels doc,chunk  --signals vector,bm25,rrf  --pools max,mean  --alphas 0.3,0.5,0.7
+    splits:  --cv 5 | --holdout 0.3 | --lopo    --final-holdout 0.2   --metric mrr|ndcg@10|recall@10|hit@5   --seed 1
+
 ENV
   NDX_EMBED_PROVIDER  local (default) | openai | voyage | hash
   OPENAI_API_KEY / VOYAGE_API_KEY    keys for those embedding providers (local/hash need none)
@@ -86,9 +98,11 @@ ENV
 EXAMPLES
   node ndx.mjs build --product auditor --provider hash
   node ndx.mjs search "active directory permissions outdated" --tier kb
-  node ndx.mjs search "configure auditing" --level doc --product auditor
   node ndx.mjs similar doc:auditor@10.8/configurator/install --cross-tier
-  node ndx.mjs cluster --level doc --tier kb --product accessanalyzer`;
+  node ndx.mjs cluster --level doc --tier kb --product accessanalyzer
+  node ndx.mjs labels --target kb
+  node ndx.mjs eval --level doc --signal rrf
+  node ndx.mjs tune --levels doc,chunk --metric ndcg@10 --cv 5`;
 
 // --- commands --------------------------------------------------------------
 
@@ -288,6 +302,112 @@ async function cmdCluster(flags) {
   });
 }
 
+// --- ranking-function tuning harness (KB articles as labels) ---------------
+
+async function getLabels(flags) {
+  const { buildLabels, loadLabelsFile } = await import('./lib/labels.mjs');
+  if (flags.labels && flags.labels !== true) return loadLabelsFile(flags.labels);
+  return buildLabels({
+    target: flags.target || 'kb',
+    gold: flags.gold || 'self',
+    queryFields: flags['query-fields'] ? splitList(flags['query-fields']) : undefined,
+    product: flags.product || null,
+  });
+}
+
+async function cmdLabels(flags) {
+  const { buildLabels, saveLabels, labelStats } = await import('./lib/labels.mjs');
+  const target = flags.target || 'kb';
+  const gold = flags.gold || 'self';
+  const recs = buildLabels({
+    target,
+    gold,
+    queryFields: flags['query-fields'] ? splitList(flags['query-fields']) : undefined,
+    product: flags.product || null,
+  });
+  const path = saveLabels(recs, target);
+  const st = labelStats(recs);
+  out(`\n${fmtInt(st.records)} labels · ${fmtInt(st.groups)} groups · target=${target} gold=${gold}`);
+  out(`saved -> ${path}`);
+  out(`\nby query field:`);
+  for (const [k, v] of Object.entries(st.byField).sort((a, b) => b[1] - a[1])) out(`  ${k.padEnd(12)} ${fmtInt(v)}`);
+  out(`\nby product (top 15 of ${Object.keys(st.byProduct).length}):`);
+  Object.entries(st.byProduct).sort((a, b) => b[1] - a[1]).slice(0, 15).forEach(([k, v]) => out(`  ${k.padEnd(26)} ${fmtInt(v)}`));
+}
+
+async function cmdEval(flags) {
+  const { evaluateConfig } = await import('./lib/evaluate.mjs');
+  let recs = await getLabels(flags);
+  if (flags.holdout) {
+    const { holdoutGroups } = await import('./lib/splits.mjs');
+    const { test } = holdoutGroups(recs, { testFrac: Number(flags.holdout), seed: Number(flags.seed || 1) });
+    recs = test.map((i) => recs[i]);
+    log(`evaluating on grouped holdout test slice (${Math.round(Number(flags.holdout) * 100)}%)`);
+  }
+  const config = {
+    level: flags.level || 'doc',
+    signal: flags.signal || 'rrf',
+    alpha: Number(flags.alpha ?? 0.5),
+    pool: flags.pool || 'max',
+    rrfK: Number(flags.rrfK || 60),
+    candN: Number(flags.candN || 200),
+  };
+  log(`evaluating ${fmtInt(recs.length)} queries · level=${config.level} signal=${config.signal} pool=${config.pool}`);
+  const rep = await evaluateConfig(recs, config, { candN: config.candN });
+  const ci = (m) => `${m.mean.toFixed(3)} [${m.lo.toFixed(3)}, ${m.hi.toFixed(3)}]`;
+  out(`\nConfig: level=${config.level} signal=${config.signal}${config.signal === 'linear' ? '@' + config.alpha : ''} pool=${config.pool}   (n=${fmtInt(rep.n)})`);
+  out(`\nOverall (95% CI, bootstrap over groups):`);
+  for (const k of ['mrr', 'hit@1', 'hit@5', 'hit@10', 'recall@10', 'ndcg@10']) out(`  ${k.padEnd(10)} ${ci(rep.overall[k])}`);
+  out(`\nMacro-avg over products:  mrr=${rep.macro.mrr.toFixed(3)}  ndcg@10=${rep.macro['ndcg@10'].toFixed(3)}  hit@5=${rep.macro['hit@5'].toFixed(3)}`);
+  out(`\nBy query field   (mrr · hit@5 · ndcg@10 · n):`);
+  for (const f of rep.byField) out(`  ${String(f.field).padEnd(12)} ${f.mrr.toFixed(3)}  ${f['hit@5'].toFixed(3)}  ${f['ndcg@10'].toFixed(3)}  ${fmtInt(f.n)}`);
+  out(`\nPer product   (mrr · hit@5 · n):`);
+  const pp = rep.perProduct;
+  const show = pp.length > 12 ? [...pp.slice(0, 6), null, ...pp.slice(-6)] : pp;
+  for (const p of show) out(p === null ? '  …' : `  ${String(p.product).padEnd(26)} ${p.mrr.toFixed(3)}  ${p['hit@5'].toFixed(3)}  ${fmtInt(p.n)}`);
+}
+
+function flagsToEval(c) {
+  let s = `--level ${c.level} --signal ${c.signal} --pool ${c.pool}`;
+  if (c.signal === 'linear') s += ` --alpha ${c.alpha}`;
+  return s;
+}
+
+async function cmdTune(flags) {
+  const { tune } = await import('./lib/evaluate.mjs');
+  const recs = await getLabels(flags);
+  const grid = {
+    levels: splitList(flags.levels || 'doc,chunk'),
+    signals: splitList(flags.signals || 'vector,bm25,rrf'),
+    pools: splitList(flags.pools || 'max,mean'),
+    alphas: flags.alphas ? splitList(flags.alphas).map(Number) : [0.3, 0.5, 0.7],
+    candN: Number(flags.candN || 200),
+  };
+  const opts = {
+    metric: flags.metric || 'mrr',
+    seed: Number(flags.seed || 1),
+    candN: grid.candN,
+    finalHoldout: Number(flags['final-holdout'] || 0),
+  };
+  if (flags.lopo) opts.lopo = true;
+  else if (flags.holdout) opts.holdout = Number(flags.holdout);
+  else opts.cv = Number(flags.cv || 5);
+
+  log(`tuning ${fmtInt(recs.length)} queries…`);
+  const res = await tune(recs, grid, opts);
+  out(`\nTuned ${res.configs} configs · ${res.scheme} · metric=${res.metric} · n=${fmtInt(res.n)}`);
+  out(`folds: ${res.folds.map((f) => `${f.name}(${fmtInt(f.n)})`).join('  ')}`);
+  out(`\n  #  ${res.metric.padEnd(10)} ±std    config`);
+  res.leaderboard.forEach((row, i) => out(`  ${String(i + 1).padStart(2)}  ${row.metric.toFixed(3)}  ±${row.std.toFixed(3)}   ${row.key}`));
+  const best = res.leaderboard[0];
+  out(`\nBest: ${best.key}   (${res.metric}=${best.metric.toFixed(3)} ±${best.std.toFixed(3)})`);
+  if (res.finalReport) {
+    const o = res.finalReport.report.overall;
+    out(`Winner on untouched final holdout (${res.finalReport.key}): mrr=${o.mrr.mean.toFixed(3)} [${o.mrr.lo.toFixed(3)}, ${o.mrr.hi.toFixed(3)}]  ndcg@10=${o['ndcg@10'].mean.toFixed(3)}`);
+  }
+  out(`\nInspect the winner in full: node ndx.mjs eval ${flagsToEval(best.config)}`);
+}
+
 // --- dispatch --------------------------------------------------------------
 async function main() {
   const [, , cmd, ...rest] = process.argv;
@@ -305,6 +425,9 @@ async function main() {
       case 'search': return await cmdSearch(pos.join(' '), flags);
       case 'similar': return await cmdSimilar(pos[0], flags);
       case 'cluster': return await cmdCluster(flags);
+      case 'labels': return await cmdLabels(flags);
+      case 'eval': return await cmdEval(flags);
+      case 'tune': return await cmdTune(flags);
       case 'help': case undefined: case '--help': case '-h': return out(HELP);
       default:
         out(`Unknown command: ${cmd}\n`);

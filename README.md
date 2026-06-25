@@ -9,6 +9,11 @@ the docs base into a property graph + multi-level vector stores + a manifest, th
 retrieval primitives — semantic search (chunk/doc/heading level), nearest-node `similar`,
 community `cluster`, and graph traversal. No built-in LLM/answer layer: you compose your own.
 
+It also includes an offline **ranking-tuning harness** that uses the KB articles as a labeled
+relevance set: `labels` / `eval` / `tune` measure and optimize the *retrieval ranking*
+(vector + BM25 hybrid, pooling, level) with grouped/stratified k-fold CV, holdout, and
+leave-one-product-out splits — see [`app/README.md`](app/README.md).
+
 ➡️ **Full usage: [`app/README.md`](app/README.md)**
 
 ## Quick start
