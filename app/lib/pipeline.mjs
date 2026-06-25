@@ -1,51 +1,63 @@
-// Build orchestration: embed the chunk corpus, and the full ingest+embed build.
+// Build orchestration: embed each level's item corpus, and the full ingest+embed build.
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { paths } from '../config.mjs';
-import { readChunks, VectorStore } from './store.mjs';
+import { paths, LEVELS, embPaths } from '../config.mjs';
+import { readItems, VectorStore } from './store.mjs';
 import { resolveEmbedConfig, embedBatch } from './embeddings.mjs';
 import { runIngest } from './ingest.mjs';
 import { log, progress, progressDone, fmtInt } from './log.mjs';
 
-// Embed chunks.jsonl -> vectors.f32 (+ vectors.meta.json), update manifest.
-export async function runEmbed(over = {}) {
-  const cfg = resolveEmbedConfig(over);
-  const chunks = readChunks();
-  if (chunks.length === 0) throw new Error('No chunks to embed. Run `ndx ingest` first.');
-
-  log(`embedding ${fmtInt(chunks.length)} chunks via ${cfg.provider}:${cfg.model}`);
+async function embedLevel(level, cfg) {
+  const items = readItems(level);
+  if (!items.length) return null;
+  log(`embedding ${level}: ${fmtInt(items.length)} items via ${cfg.provider}:${cfg.model}`);
   let dim = cfg.dim;
   let vectors = null;
-  for (let i = 0; i < chunks.length; i += cfg.batchSize) {
-    const batch = chunks.slice(i, i + cfg.batchSize).map((c) => c.text);
+  for (let i = 0; i < items.length; i += cfg.batchSize) {
+    const batch = items.slice(i, i + cfg.batchSize).map((it) => it.text);
     const vecs = await embedBatch(batch, cfg, 'document');
     if (!vectors) {
       dim = vecs[0].length; // trust the model's actual dimensionality
-      vectors = new Float32Array(chunks.length * dim);
+      vectors = new Float32Array(items.length * dim);
     }
     vecs.forEach((v, j) => vectors.set(v, (i + j) * dim));
-    progress(`embedded ${fmtInt(Math.min(i + batch.length, chunks.length))}/${fmtInt(chunks.length)}…`);
+    progress(`  ${level}: ${fmtInt(Math.min(i + batch.length, items.length))}/${fmtInt(items.length)}…`);
   }
   progressDone();
+  VectorStore.saveVectors(level, vectors, items.length, dim, cfg);
+  return { count: items.length, dim };
+}
 
-  cfg.dim = dim;
-  VectorStore.save(vectors, chunks.length, dim, cfg);
-  log(`wrote ${fmtInt(chunks.length)} vectors (${dim}d) -> ${paths.vectors}`);
+// Embed the requested levels (default: all that have an item corpus on disk).
+export async function runEmbed({ levels, ...over } = {}) {
+  const cfg = resolveEmbedConfig(over);
+  const targets = (levels && levels.length ? levels : LEVELS).filter((l) => existsSync(embPaths(l).jsonl));
+  if (!targets.length) throw new Error('No item corpora to embed. Run `ndx ingest` first.');
 
-  // annotate the manifest with the embedding model used
+  const byLevel = {};
+  for (const level of targets) {
+    const r = await embedLevel(level, cfg);
+    if (r) byLevel[level] = r;
+  }
+
   if (existsSync(paths.manifest)) {
     try {
       const m = JSON.parse(readFileSync(paths.manifest, 'utf8'));
-      m.embedding = { provider: cfg.provider, model: cfg.model, dim, count: chunks.length };
+      m.embedding = { provider: cfg.provider, model: cfg.model, byLevel };
+      m.levels = m.levels || {};
+      for (const [lvl, info] of Object.entries(byLevel)) {
+        m.levels[lvl] = { items: (m.levels[lvl] && m.levels[lvl].items) || info.count, dim: info.dim, vectors: info.count };
+      }
       writeFileSync(paths.manifest, JSON.stringify(m, null, 2));
     } catch {
       /* non-fatal */
     }
   }
-  return { count: chunks.length, dim, provider: cfg.provider, model: cfg.model };
+  log(`embedded: ${Object.entries(byLevel).map(([l, r]) => `${l}=${fmtInt(r.count)}`).join(', ')} (${cfg.provider}:${cfg.model})`);
+  return { provider: cfg.provider, model: cfg.model, byLevel };
 }
 
-// Full build: ingest then embed.
+// Full build: ingest then embed all levels.
 export async function runBuild({ embed = {}, ...ingestOpts } = {}) {
   const ing = await runIngest(ingestOpts);
   const emb = await runEmbed(embed);

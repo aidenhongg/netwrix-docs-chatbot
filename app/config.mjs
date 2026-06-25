@@ -11,20 +11,33 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const APP_DIR = __dirname;
 export const REPO_DIR = resolve(APP_DIR, '..');
-// The Docusaurus content root: chatbot/docs/docs/<product>/...
-export const DOCS_ROOT = resolve(REPO_DIR, 'docs', 'docs');
+// The Docusaurus content root: chatbot/docs/docs/<product>/...  (override with NDX_DOCS)
+export const DOCS_ROOT = process.env.NDX_DOCS
+  ? resolve(process.env.NDX_DOCS)
+  : resolve(REPO_DIR, 'docs', 'docs');
 // The canonical product manifest that the docs site itself is built from.
 export const PRODUCTS_CONFIG = resolve(REPO_DIR, 'docs', 'src', 'config', 'products.js');
 
 export const OUT_DIR = process.env.NDX_OUT ? resolve(process.env.NDX_OUT) : join(APP_DIR, 'out');
+export const EMB_DIR = join(OUT_DIR, 'emb');
+
+// Embedding "levels" — each is an independent vector space keyed by node id:
+//   chunk   : passage-level (best for RAG answers)
+//   doc     : whole Document / KBArticle (find-similar-docs, cross-version, clustering)
+//   heading : per Heading/Subheading section (jump-to-section)
+export const LEVELS = ['chunk', 'doc', 'heading'];
 
 export const paths = {
   graph: join(OUT_DIR, 'graph.json'),
-  chunks: join(OUT_DIR, 'chunks.jsonl'),
-  vectors: join(OUT_DIR, 'vectors.f32'),
-  vectorsMeta: join(OUT_DIR, 'vectors.meta.json'),
   manifest: join(OUT_DIR, 'manifest.json'),
 };
+
+// File set for one embedding level.
+export const embPaths = (level) => ({
+  jsonl: join(EMB_DIR, `${level}.jsonl`), // one item record per line (id, tier, text, …)
+  vectors: join(EMB_DIR, `${level}.f32`), // packed Float32, count*dim, aligned to jsonl
+  meta: join(EMB_DIR, `${level}.meta.json`),
+});
 
 export const config = {
   paths,
@@ -34,6 +47,10 @@ export const config = {
     overlapChars: Number(process.env.NDX_CHUNK_OVERLAP || 240), // ~60 tokens
     minChars: 64, // drop near-empty fragments
   },
+  // --- Document-level embedding text budget ---
+  doc: { maxChars: Number(process.env.NDX_DOC_CHARS || 1600) },
+  // --- Heading-level embedding text budget ---
+  heading: { maxChars: Number(process.env.NDX_HEADING_CHARS || 1000) },
   // --- Embeddings ---
   embed: {
     // local  : free, on-device MiniLM via @huggingface/transformers (384d)

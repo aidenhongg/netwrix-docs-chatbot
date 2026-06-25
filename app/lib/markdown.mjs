@@ -137,6 +137,48 @@ export function extractStructure(body) {
   return { headings, links: [...links], images: [...images] };
 }
 
+// One section per heading (body = text until the next heading), aligned 1:1 with
+// extractStructure().headings, plus the preamble before the first heading. Used
+// to build heading-level and doc-level embedding text.
+export function extractSections(body) {
+  const lines = body.split(/\r?\n/);
+  let inFence = false;
+  let crumbs = []; // ancestor stack [{level,text}]
+  let cur = null;
+  const sections = [];
+  const preamble = [];
+
+  for (const line of lines) {
+    if (FENCE.test(line.trim())) {
+      inFence = !inFence;
+      (cur ? cur.bodyLines : preamble).push(line);
+      continue;
+    }
+    const m = !inFence && line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (m) {
+      const level = m[1].length;
+      const text = m[2].replace(/[`*_]/g, '').trim();
+      crumbs = crumbs.filter((c) => c.level < level);
+      cur = { level, text, slug: slugifyHeading(text), crumbs: crumbs.map((c) => c.text), bodyLines: [] };
+      crumbs.push({ level, text });
+      sections.push(cur);
+      continue;
+    }
+    (cur ? cur.bodyLines : preamble).push(line);
+  }
+
+  return {
+    preamble: preamble.join('\n').trim(),
+    sections: sections.map((s) => ({
+      level: s.level,
+      text: s.text,
+      slug: s.slug,
+      crumbs: s.crumbs,
+      body: s.bodyLines.join('\n').trim(),
+    })),
+  };
+}
+
 // --- Chunking --------------------------------------------------------------
 
 // Split body into heading-scoped sections, then window each section to ~maxChars
@@ -229,9 +271,10 @@ function windowText(text, maxChars, overlapChars) {
 export function parseMarkdown(src, opts = {}) {
   const { data, body } = parseFrontmatter(src);
   const title = data.title || opts.fallbackTitle || '';
-  const struct = extractStructure(body);
+  const struct = extractStructure(body); // { headings, links, images }
+  const { preamble, sections } = extractSections(body); // sections aligned to headings
   const chunks = chunkBody(body, { title });
-  return { data, body, title, ...struct, chunks };
+  return { data, body, title, ...struct, preamble, sections, chunks };
 }
 
-export default { parseFrontmatter, parseMarkdown, extractStructure, chunkBody, slugifyHeading };
+export default { parseFrontmatter, parseMarkdown, extractStructure, extractSections, chunkBody, slugifyHeading };

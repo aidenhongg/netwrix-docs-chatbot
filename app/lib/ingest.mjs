@@ -12,7 +12,8 @@ import { DOCS_ROOT, OUT_DIR, paths, config, slug } from '../config.mjs';
 import { buildIndex, getCategories, classifyPath } from './products.mjs';
 import { parseMarkdown } from './markdown.mjs';
 import { Graph, NODE_TYPES } from './graph.mjs';
-import { openChunkWriter } from './store.mjs';
+import { openItemWriter } from './store.mjs';
+import { docEmbedText, headingEmbedText } from './embedtext.mjs';
 import { log, progress, progressDone, fmtInt } from './log.mjs';
 
 const SKIP_DIRS = new Set([
@@ -48,7 +49,10 @@ export async function runIngest({ productFilter = null, limit = 0, includeImages
     g.addEdge('root', catId(c), 'CONTAINS');
   }
 
-  const chunkWriter = openChunkWriter();
+  // One streamed item corpus per embedding level (chunk | doc | heading).
+  const chunkW = openItemWriter('chunk');
+  const docW = openItemWriter('doc');
+  const headW = openItemWriter('heading');
   const linkMap = new Map(); // normalized path/url -> docId
   const pendingLinks = []; // { from, dirParts, targets }
   const counts = { files: 0, documents: 0, kbArticles: 0, chunks: 0, headings: 0, images: 0 };
@@ -209,9 +213,30 @@ export async function runIngest({ productFilter = null, limit = 0, includeImages
       ref = `${info.productName} ${version} — ${title}`;
     }
 
-    // headings
+    // document-level embedding item (KB folds in keywords/tags; see embedtext.mjs)
+    docW.write({
+      id: docId,
+      type: info.isKB ? 'KBArticle' : 'Document',
+      tier,
+      product: pid,
+      version: info.version || null,
+      label: title,
+      ref,
+      url: info.url,
+      text: docEmbedText({
+        title,
+        description: parsed.data.description || '',
+        tier,
+        data: parsed.data,
+        headings: parsed.headings,
+        preamble: parsed.preamble,
+        sections: parsed.sections,
+      }),
+    });
+
+    // headings: graph nodes + heading-level embedding items (sections align 1:1)
     const seenSlug = new Map();
-    for (const h of parsed.headings) {
+    parsed.headings.forEach((h, hi) => {
       let s = h.slug || slug(h.text);
       const n = (seenSlug.get(s) || 0) + 1;
       seenSlug.set(s, n);
@@ -221,7 +246,19 @@ export async function runIngest({ productFilter = null, limit = 0, includeImages
       g.addNode(hid, htype, { label: h.text, level: h.level });
       g.addEdge(docId, hid, h.level <= 2 ? 'HAS_HEADING' : 'HAS_SUBHEADING');
       counts.headings++;
-    }
+      const sec = parsed.sections[hi];
+      headW.write({
+        id: hid,
+        type: htype,
+        tier,
+        product: pid,
+        version: info.version || null,
+        label: h.text,
+        ref: `${ref} › ${h.text}`,
+        url: info.url ? `${info.url}#${s}` : '',
+        text: headingEmbedText({ title, crumbs: sec ? sec.crumbs : [], heading: h.text, body: sec ? sec.body : '' }),
+      });
+    });
 
     // images (optional — there are tens of thousands of assets)
     if (includeImages) {
@@ -241,14 +278,16 @@ export async function runIngest({ productFilter = null, limit = 0, includeImages
       g.addEdge(docId, cid, 'HAS_CHUNK');
       if (prevChunk) g.addEdge(prevChunk, cid, 'NEXT');
       prevChunk = cid;
-      chunkWriter.write({
+      chunkW.write({
         id: cid,
+        type: 'Chunk',
         docId,
         ref,
         url: info.url,
         tier,
         product: pid,
         version: info.version || null,
+        label: title,
         title,
         headingPath: c.headingPath,
         text: c.text,
@@ -297,7 +336,9 @@ export async function runIngest({ productFilter = null, limit = 0, includeImages
   }
   log(`resolved ${fmtInt(linkEdges)} cross-document links`);
 
-  chunkWriter.close();
+  const chunkCount = chunkW.close();
+  const docCount = docW.close();
+  const headCount = headW.close();
   g.save(paths.graph);
   const gstats = g.stats();
 
@@ -325,6 +366,12 @@ export async function runIngest({ productFilter = null, limit = 0, includeImages
     },
     counts: { ...counts, nodes: gstats.nodes, edges: gstats.edges, links: linkEdges },
     graph: { nodeTypes: gstats.byType, edgeRelations: gstats.byRel, schema: { nodeTypes: NODE_TYPES } },
+    // Embedding levels (item corpora); vectors filled in by the embed step.
+    levels: {
+      chunk: { items: chunkCount },
+      doc: { items: docCount },
+      heading: { items: headCount },
+    },
     categories,
     products,
     embedding: null, // filled in by the embed step

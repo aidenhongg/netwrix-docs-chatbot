@@ -1,55 +1,75 @@
-// Flat-file vector store. Designed to be cheap to build and trivial to inspect.
+// Flat-file vector store, one per embedding "level" (chunk | doc | heading).
+// Every item is keyed by its graph node id, so any node type becomes
+// semantically searchable / clusterable without bloating graph.json.
 //
-//   chunks.jsonl    - one JSON record per chunk (id, doc ref, metadata, text)
-//   vectors.f32     - packed little-endian Float32, N * dim, aligned to chunks.jsonl order
-//   vectors.meta.json - { provider, model, dim, count }
+//   emb/<level>.jsonl      - one item record per line (id, type, tier, …, text)
+//   emb/<level>.f32        - packed little-endian Float32, N*dim, aligned to jsonl
+//   emb/<level>.meta.json  - { provider, model, dim, count, level }
 //
-// Search is a brute-force dot product (vectors are normalized). For ~100k chunks
+// Search is a brute-force dot product (vectors are normalized). For ~100k items
 // this is milliseconds in Node and keeps the system dependency-free and portable.
 
-import { readFileSync, writeFileSync, openSync, writeSync, closeSync, existsSync } from 'node:fs';
-import { paths } from '../config.mjs';
+import {
+  readFileSync, writeFileSync, openSync, writeSync, closeSync, existsSync, mkdirSync,
+} from 'node:fs';
+import { embPaths, EMB_DIR } from '../config.mjs';
 
 export class VectorStore {
-  constructor(dim) {
+  constructor(level, dim) {
+    this.level = level;
     this.dim = dim;
     this.vectors = null; // Float32Array (count*dim)
-    this.metas = []; // chunk metadata records (parsed from chunks.jsonl)
+    this.metas = []; // item metadata records (parsed from <level>.jsonl)
     this.count = 0;
+    this.idIndex = new Map(); // node id -> row index (for `similar`)
   }
 
-  static exists() {
-    return existsSync(paths.vectors) && existsSync(paths.vectorsMeta) && existsSync(paths.chunks);
+  static exists(level) {
+    const p = embPaths(level);
+    return existsSync(p.vectors) && existsSync(p.meta) && existsSync(p.jsonl);
   }
 
-  static load() {
-    const meta = JSON.parse(readFileSync(paths.vectorsMeta, 'utf8'));
-    const store = new VectorStore(meta.dim);
+  static load(level) {
+    const p = embPaths(level);
+    const meta = JSON.parse(readFileSync(p.meta, 'utf8'));
+    const store = new VectorStore(level, meta.dim);
     store.provider = meta.provider;
     store.model = meta.model;
 
-    const buf = readFileSync(paths.vectors);
+    const buf = readFileSync(p.vectors);
     store.vectors = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
     store.count = store.vectors.length / meta.dim;
 
-    const lines = readFileSync(paths.chunks, 'utf8').split('\n').filter(Boolean);
-    store.metas = lines.map((l) => JSON.parse(l));
+    store.metas = readFileSync(p.jsonl, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
     if (store.metas.length !== store.count) {
       throw new Error(
-        `Vector/chunk count mismatch: ${store.count} vectors vs ${store.metas.length} chunks. Rebuild with 'ndx build'.`
+        `Vector/item mismatch for '${level}': ${store.count} vectors vs ${store.metas.length} items. Rebuild with 'ndx build'.`
       );
     }
+    store.metas.forEach((m, i) => store.idIndex.set(m.id, i));
     return store;
   }
 
-  // Save vectors aligned to an existing chunks.jsonl (which ingest already wrote).
-  static save(vectors, count, dim, providerInfo) {
-    const buf = Buffer.from(vectors.buffer, vectors.byteOffset, count * dim * 4);
-    writeFileSync(paths.vectors, buf);
+  // Save vectors aligned to an existing <level>.jsonl (which ingest already wrote).
+  static saveVectors(level, vectors, count, dim, providerInfo) {
+    mkdirSync(EMB_DIR, { recursive: true });
+    const p = embPaths(level);
+    writeFileSync(p.vectors, Buffer.from(vectors.buffer, vectors.byteOffset, count * dim * 4));
     writeFileSync(
-      paths.vectorsMeta,
-      JSON.stringify({ provider: providerInfo.provider, model: providerInfo.model, dim, count }, null, 2)
+      p.meta,
+      JSON.stringify(
+        { provider: providerInfo.provider, model: providerInfo.model, dim, count, level },
+        null,
+        2
+      )
     );
+  }
+
+  // Look up a stored node's own vector (for similarity / nearest-neighbour queries).
+  getById(id) {
+    const i = this.idIndex.get(id);
+    if (i === undefined) return null;
+    return { index: i, meta: this.metas[i], vector: this.vectors.subarray(i * this.dim, (i + 1) * this.dim) };
   }
 
   // Top-k by cosine (dot product on normalized vectors), with optional filter.
@@ -68,10 +88,10 @@ export class VectorStore {
   }
 }
 
-// Stream chunk records to chunks.jsonl during ingestion without holding them all
-// in memory. Returns a writer with .write(record) and .close().
-export function openChunkWriter() {
-  const fd = openSync(paths.chunks, 'w');
+// Stream item records to emb/<level>.jsonl during ingestion (no full-corpus buffering).
+export function openItemWriter(level) {
+  mkdirSync(EMB_DIR, { recursive: true });
+  const fd = openSync(embPaths(level).jsonl, 'w');
   let n = 0;
   return {
     write(rec) {
@@ -88,10 +108,11 @@ export function openChunkWriter() {
   };
 }
 
-// Read chunks.jsonl back (used by `embed`).
-export function readChunks() {
-  if (!existsSync(paths.chunks)) throw new Error(`No chunks at ${paths.chunks}. Run 'ndx ingest' first.`);
-  return readFileSync(paths.chunks, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+// Read an item corpus back (used by `embed`).
+export function readItems(level) {
+  const p = embPaths(level);
+  if (!existsSync(p.jsonl)) throw new Error(`No '${level}' items at ${p.jsonl}. Run 'ndx ingest' first.`);
+  return readFileSync(p.jsonl, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
-export default { VectorStore, openChunkWriter, readChunks };
+export default { VectorStore, openItemWriter, readItems };
