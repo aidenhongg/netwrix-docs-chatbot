@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-// ndx — Netwrix Documentation knowledge-graph + RAG chatbot CLI.
+// ndx — Netwrix documentation knowledge-graph + retrieval harness CLI.
 //
 //   node ndx.mjs <command> [args] [--flags]
 //
 // Build:    build · ingest · embed
 // Inspect:  stats · manifest · node · neighbors · path
-// Query:    search · ask · chat
+// Query:    search · similar · cluster
 //
-// Run `node ndx.mjs help` for the full list.
+// Retrieval primitives only — no built-in answer/LLM layer (compose your own on
+// retrieve()/similar()). Run `node ndx.mjs help` for the full list.
 
 import { existsSync, readFileSync } from 'node:fs';
-import readline from 'node:readline';
-import { config, paths } from './config.mjs';
+import { paths } from './config.mjs';
 import { out, log, fmtInt } from './lib/log.mjs';
 
 // --- tiny arg parser -------------------------------------------------------
@@ -52,7 +52,7 @@ const embedOver = (f) => {
 const levelsOf = (f) => (f.levels ? String(f.levels).split(',').map((s) => s.trim()).filter(Boolean) : null);
 const fmtByLevel = (bl) => Object.entries(bl).map(([l, v]) => `${l}=${fmtInt(v.count)} (${v.dim}d)`).join(', ');
 
-const HELP = `ndx — Netwrix documentation knowledge graph + RAG chatbot
+const HELP = `ndx — Netwrix documentation knowledge graph + retrieval harness
 
 USAGE
   node ndx.mjs <command> [args] [--flags]
@@ -76,21 +76,19 @@ QUERY  (--level chunk|doc|heading selects the embedding space; default chunk)
   search <query>      Semantic search          [--level L -k N --tier docs|kb --product id]
   similar <nodeId>    Nearest nodes to a node  [-k N --cross-tier --product id --level L]
   cluster             Community detection       [--level doc|heading --tier docs|kb --product id --threshold 0.55]
-  ask <question>      RAG answer with citations [-k N --tier --product --model M]
-  chat                Interactive RAG REPL      [-k N --model M --tier --product]
+
+  (No answer/LLM command by design — compose your own on retrieve()/similar(); see README.)
 
 ENV
   NDX_EMBED_PROVIDER  local (default) | openai | voyage | hash
-  NDX_CHAT_MODEL      claude-haiku-4-5 (default) | claude-opus-4-8 | ...
-  ANTHROPIC_API_KEY   required for ask/chat   OPENAI_API_KEY / VOYAGE_API_KEY for those providers
+  OPENAI_API_KEY / VOYAGE_API_KEY    keys for those embedding providers (local/hash need none)
 
 EXAMPLES
   node ndx.mjs build --product auditor --provider hash
   node ndx.mjs search "active directory permissions outdated" --tier kb
   node ndx.mjs search "configure auditing" --level doc --product auditor
   node ndx.mjs similar doc:auditor@10.8/configurator/install --cross-tier
-  node ndx.mjs cluster --level doc --tier kb --product accessanalyzer
-  node ndx.mjs ask "How do I configure SQL Server auditing?" --product auditor`;
+  node ndx.mjs cluster --level doc --tier kb --product accessanalyzer`;
 
 // --- commands --------------------------------------------------------------
 
@@ -290,48 +288,6 @@ async function cmdCluster(flags) {
   });
 }
 
-async function cmdAsk(question, flags) {
-  const { retrieve } = await import('./lib/retrieve.mjs');
-  const { answer } = await import('./lib/chat.mjs');
-  const hits = await retrieve(question, {
-    k: Number(flags.k || config.chat.topK),
-    tier: flags.tier || null,
-    product: flags.product || null,
-  });
-  if (hits.length === 0) return out('No relevant passages found. Is the store built?');
-  const { reply, sources, model } = await answer(question, hits, { model: flags.model });
-  out(`\n${reply}\n`);
-  out(`— sources (${model}) —`);
-  for (const s of sources) out(`  [${s.n}] ${s.ref}${s.url ? '  ' + s.url : ''}`);
-}
-
-async function cmdChat(flags) {
-  const { retrieve } = await import('./lib/retrieve.mjs');
-  const { answerWithHistory } = await import('./lib/chat.mjs');
-  const model = flags.model || config.chat.model;
-  const k = Number(flags.k || config.chat.topK);
-  out(`ndx chat — model ${model}. Ask about the Netwrix docs. Ctrl-C or "exit" to quit.\n`);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = () => rl.question('› ', async (q) => {
-    q = q.trim();
-    if (!q) return ask();
-    if (q === 'exit' || q === 'quit') return rl.close();
-    try {
-      const hits = await retrieve(q, { k, tier: flags.tier || null, product: flags.product || null });
-      const { reply, sources, userMessage } = await answerWithHistory(q, hits, history, { model });
-      out(`\n${reply}\n`);
-      out(`  sources: ${sources.map((s) => `[${s.n}] ${s.ref}`).join(' · ')}\n`);
-      history.push(userMessage, { role: 'assistant', content: reply });
-      if (history.length > 8) history.splice(0, history.length - 8); // keep last few turns
-    } catch (e) {
-      out(`! ${e.message}\n`);
-    }
-    ask();
-  });
-  const history = [];
-  ask();
-}
-
 // --- dispatch --------------------------------------------------------------
 async function main() {
   const [, , cmd, ...rest] = process.argv;
@@ -349,8 +305,6 @@ async function main() {
       case 'search': return await cmdSearch(pos.join(' '), flags);
       case 'similar': return await cmdSimilar(pos[0], flags);
       case 'cluster': return await cmdCluster(flags);
-      case 'ask': return await cmdAsk(pos.join(' '), flags);
-      case 'chat': return await cmdChat(flags);
       case 'help': case undefined: case '--help': case '-h': return out(HELP);
       default:
         out(`Unknown command: ${cmd}\n`);

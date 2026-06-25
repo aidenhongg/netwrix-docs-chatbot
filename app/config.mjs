@@ -61,13 +61,6 @@ export const config = {
     model: process.env.NDX_EMBED_MODEL || '', // '' => provider default
     batchSize: Number(process.env.NDX_EMBED_BATCH || 64),
   },
-  // --- Generation (RAG answer) ---
-  chat: {
-    // Cheap by default; override with NDX_CHAT_MODEL=claude-opus-4-8 for quality.
-    model: process.env.NDX_CHAT_MODEL || 'claude-haiku-4-5',
-    maxTokens: Number(process.env.NDX_CHAT_MAX_TOKENS || 1024),
-    topK: Number(process.env.NDX_TOPK || 8),
-  },
 };
 
 // ~4 chars per token is a decent estimate for English docs.

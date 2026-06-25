@@ -1,4 +1,6 @@
-// Retrieval primitives over the per-level vector stores.
+// Retrieval primitives over the per-level vector stores. This is the composition
+// seam: build your own answer layer (query form, sub-agent, hybrid, or nothing)
+// on top of these — the harness deliberately encodes no generation strategy.
 //
 //   retrieve(query, {level})   - semantic search at chunk | doc | heading granularity
 //   similar(nodeId)            - nearest nodes to an existing node in its own space
@@ -54,24 +56,4 @@ export function similar(nodeId, { k = 8, crossTier = false, product = null, leve
   return s.search(self.vector, k, filter);
 }
 
-// Format hits into a numbered context block + a parallel source list for citations.
-export function buildContext(hits) {
-  const sources = hits.map((h, i) => ({
-    n: i + 1,
-    ref: h.ref,
-    url: h.url,
-    tier: h.tier,
-    product: h.product,
-    version: h.version,
-    score: h.score,
-  }));
-  const text = hits
-    .map((h, i) => {
-      const where = [h.ref, h.url].filter(Boolean).join('  ');
-      return `[${i + 1}] ${where}\n${h.text}`;
-    })
-    .join('\n\n----------\n\n');
-  return { text, sources };
-}
-
-export default { retrieve, similar, buildContext, levelForNode };
+export default { retrieve, similar, levelForNode };

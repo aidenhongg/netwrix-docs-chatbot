@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Netwrix documentation knowledge graph + RAG chatbot",
+  "description": "Netwrix documentation knowledge graph + retrieval harness",
   "bin": {
     "ndx": "./ndx.mjs"
   },
@@ -13,11 +13,8 @@
     "embed": "node ndx.mjs embed",
     "stats": "node ndx.mjs stats",
     "search": "node ndx.mjs search",
-    "ask": "node ndx.mjs ask",
-    "chat": "node ndx.mjs chat"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.106.0"
+    "similar": "node ndx.mjs similar",
+    "cluster": "node ndx.mjs cluster"
   },
   "optionalDependencies": {
     "@huggingface/transformers": "^4.2.0"

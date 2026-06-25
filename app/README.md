@@ -9,7 +9,11 @@ A small, dependency-light pipeline that turns the entire Netwrix documentation b
 - a **manifest** (`out/manifest.json`) describing the transformed base,
 
 and a CLI (`ndx.mjs`) to **search** (at any level), find **similar** nodes, **cluster**
-nodes into communities, **traverse the graph**, and **chat** (RAG) over it.
+nodes into communities, and **traverse the graph**.
+
+It deliberately stops at **retrieval primitives** — there is no built-in answer/LLM layer,
+so you can compose your own (query form, sub-agent, hybrid, or none) on `retrieve()` /
+`similar()` without inheriting an encoded strategy.
 
 The core pipeline (ingest → graph → chunks → vectors → retrieval) is **pure Node, zero
 dependencies**. Real embedding models and Claude generation are opt-in.
@@ -39,10 +43,6 @@ node ndx.mjs cluster --level doc --product 1secure --threshold 0.6
 # 5) Traverse the graph
 node ndx.mjs node product:1secure                # also lists its nearest doc nodes
 node ndx.mjs neighbors kbroot --rel CONTAINS
-
-# 6) Ask a question (needs ANTHROPIC_API_KEY; defaults to cheap claude-haiku-4-5)
-export ANTHROPIC_API_KEY=sk-ant-...
-node ndx.mjs ask "How do I add a data source in 1Secure?"
 ```
 
 Drop `--product 1secure` to build the **whole** base.
@@ -68,13 +68,10 @@ QUERY  (--level chunk|doc|heading picks the embedding space; default chunk)
   search <query>   Semantic search          [--level L -k N --tier docs|kb --product id]
   similar <nodeId> Nearest nodes to a node  [-k N --cross-tier --product id --level L]
   cluster          Community detection       [--level doc|heading --tier docs|kb --product id --threshold T]
-  ask <question>   RAG answer with citations [-k N --tier --product --model M]
-  chat             Interactive RAG REPL
 ```
 
 Common flags: `--product <id>`, `--limit <n>`, `--images`, `--level <chunk|doc|heading>`,
-`--provider local|openai|voyage|hash`, `--embed-model <name>`, `--levels <list>`,
-`--model <claude-model>`.
+`--provider local|openai|voyage|hash`, `--embed-model <name>`, `--levels <list>`.
 
 ## Semantic levels & node primitives
 
@@ -118,15 +115,22 @@ same provider/model the corpus was built with (recorded in `out/vectors.meta.jso
 Whole-base cost is tiny: ~30–40M tokens → well under **$1** on `openai`/`voyage`, **$0** on
 `local`/`hash`. `local` is the recommended default for quality with no API key.
 
-## Generation (the chatbot answer)
+## Building an answer layer (bring your own)
 
-Uses Claude via `@anthropic-ai/sdk` (falls back to raw `fetch` if the SDK isn't installed).
-Default model is **`claude-haiku-4-5`** (cheap); override with `--model claude-opus-4-8` or
-`NDX_CHAT_MODEL`. Needs `ANTHROPIC_API_KEY`. Search and graph commands need no key.
+This is a **retrieval harness, not a chatbot** — there is intentionally no built-in
+generation/LLM step, so no answer strategy is baked in. Compose whatever you want on top of
+the primitives:
 
-```bash
-npm install            # installs @anthropic-ai/sdk + @huggingface/transformers
+```js
+import { retrieve, similar } from './lib/retrieve.mjs';
+
+const hits = await retrieve('how do I reset a password', { level: 'chunk', k: 8, tier: 'kb' });
+// hits: [{ id, score, ref, url, tier, product, version, text, ... }]
+// → format these however you like and call any model, run a sub-agent, a query form, or nothing.
 ```
+
+Nothing in the harness calls an LLM, so it has **no required dependencies** (only the
+optional on-device embedder, used for `--provider local`).
 
 ---
 
@@ -164,9 +168,8 @@ app/
     store.mjs        per-level vector stores (jsonl + packed float32) + cosine search
     ingest.mjs       docs tree -> graph + chunk/doc/heading corpora + manifest
     pipeline.mjs     per-level embed + full build orchestration
-    retrieve.mjs     retrieve(level) + similar(nodeId) — tier-aware
+    retrieve.mjs     retrieve(level) + similar(nodeId) — tier-aware (the composition seam)
     cluster.mjs      community detection over node vectors (union-find)
-    chat.mjs         Claude RAG generation (SDK with fetch fallback)
   out/               generated artifacts, incl. emb/<level>.{jsonl,f32} (gitignored)
 ```
 
